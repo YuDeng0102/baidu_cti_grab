@@ -267,14 +267,17 @@ class RepEncoder(nn.Module):
 
 
 def scaled_dot_product(q, k, v, extension):
-    d = q.size(-1)
-    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d)
+    mask = None
     if extension is not None and "mask" in extension:
         mask = extension["mask"]
-        scores = scores.masked_fill(mask == 0, float("-inf"))
-    attn = torch.softmax(scores, dim=-1)
-    out = torch.matmul(attn, v)
-    return out
+    return F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=mask,
+        dropout_p=0.0,
+        is_causal=False,
+    )
 
 
 class Expert(nn.Module):
@@ -725,4 +728,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
