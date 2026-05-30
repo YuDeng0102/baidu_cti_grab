@@ -1,5 +1,6 @@
 import sys
 import os
+import csv
 
 # 获取当前环境脚本所在目录或指定绝对路径
 if os.path.exists("../libraries"):
@@ -10,12 +11,72 @@ import math
 import argparse
 from pathlib import Path
 from collections import defaultdict
+from contextlib import nullcontext
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+
+try:
+    from flash_attn import flash_attn_varlen_qkvpacked_func
+except Exception:
+    flash_attn_varlen_qkvpacked_func = None
+
+
+PROFILE_SCOPES = False
+
+
+def record_scope(name):
+    if PROFILE_SCOPES:
+        return torch.profiler.record_function(name)
+    return nullcontext()
+
+
+def export_profiler_csv(prof, output_path):
+    rows = prof.key_averages()
+    fieldnames = [
+        "name",
+        "calls",
+        "self_cpu_time_total_us",
+        "cpu_time_total_us",
+        "cpu_time_avg_us",
+        "self_cuda_time_total_us",
+        "cuda_time_total_us",
+        "cuda_time_avg_us",
+        "cpu_memory_usage_bytes",
+        "self_cpu_memory_usage_bytes",
+        "cuda_memory_usage_bytes",
+        "self_cuda_memory_usage_bytes",
+    ]
+    with open(output_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            calls = row.count
+            self_cuda_time_total = getattr(row, "self_cuda_time_total",
+                                           getattr(row, "self_device_time_total", 0))
+            cuda_time_total = getattr(row, "cuda_time_total",
+                                      getattr(row, "device_time_total", 0))
+            cuda_memory_usage = getattr(row, "cuda_memory_usage",
+                                        getattr(row, "device_memory_usage", 0))
+            self_cuda_memory_usage = getattr(row, "self_cuda_memory_usage",
+                                             getattr(row, "self_device_memory_usage", 0))
+            writer.writerow({
+                "name": row.key,
+                "calls": calls,
+                "self_cpu_time_total_us": row.self_cpu_time_total,
+                "cpu_time_total_us": row.cpu_time_total,
+                "cpu_time_avg_us": row.cpu_time_total / calls if calls else 0,
+                "self_cuda_time_total_us": self_cuda_time_total,
+                "cuda_time_total_us": cuda_time_total,
+                "cuda_time_avg_us": cuda_time_total / calls if calls else 0,
+                "cpu_memory_usage_bytes": row.cpu_memory_usage,
+                "self_cpu_memory_usage_bytes": row.self_cpu_memory_usage,
+                "cuda_memory_usage_bytes": cuda_memory_usage,
+                "self_cuda_memory_usage_bytes": self_cuda_memory_usage,
+            })
 
 
 # ============================================================
@@ -251,19 +312,22 @@ class RepEncoder(nn.Module):
         self.linear = nn.Linear(in_features=slot_num * emb_dim, out_features=d_model)
 
     def forward(self, batch):
-        pooled_embs = []
-        max_idx = self.emb.num_embeddings - 1
-        for i in range(self.slot_num):
-            values, offsets = batch[i + 1]
-            offsets = offsets.to(values.device)
-            values = values.clamp(0, max_idx)  # 超出 vocab_size 的 sign id 截断，避免越界
-            sign_emb = self.emb(values)
-            res = torch.segment_reduce(sign_emb, reduce='sum', offsets=offsets, initial=0)
-            pooled_embs.append(res)
-        fused_embs = torch.cat(pooled_embs, dim=1)
-        norm_emb = self.input_norm(fused_embs)
-        rep_emb = self.linear(norm_emb)
-        return rep_emb
+        with record_scope("RepEncoder"):
+            pooled_embs = []
+            max_idx = self.emb.num_embeddings - 1
+            for i in range(self.slot_num):
+                with record_scope(f"RepEncoder/slot_{i + 1:02d}"):
+                    values, offsets = batch[i + 1]
+                    offsets = offsets.to(values.device)
+                    values = values.clamp(0, max_idx)  # 超出 vocab_size 的 sign id 截断，避免越界
+                    sign_emb = self.emb(values)
+                    res = torch.segment_reduce(sign_emb, reduce='sum', offsets=offsets, initial=0)
+                    pooled_embs.append(res)
+            with record_scope("RepEncoder/fuse"):
+                fused_embs = torch.cat(pooled_embs, dim=1)
+                norm_emb = self.input_norm(fused_embs)
+                rep_emb = self.linear(norm_emb)
+            return rep_emb
 
 
 def scaled_dot_product(q, k, v, extension):
@@ -324,51 +388,55 @@ class SMoE(nn.Module):
         self.gate = TopKGate(d_model, num_experts, k=k)
 
     def forward(self, x):
-        # x: [B,S,D]
-        B, S, D = x.shape
+        with record_scope("SMoE"):
+            # x: [B,S,D]
+            B, S, D = x.shape
 
-        topk_idx, topk_score, probs = self.gate(x)
+            with record_scope("SMoE/gate"):
+                topk_idx, topk_score, probs = self.gate(x)
 
-        out = torch.zeros_like(x)
+            out = torch.zeros_like(x)
 
-        # flatten
-        x_flat = x.reshape(-1, D)                # [B*S, D]
-        idx_flat = topk_idx.reshape(-1, self.k)  # [B*S, k]
-        score_flat = topk_score.reshape(-1, self.k)
+            # flatten
+            x_flat = x.reshape(-1, D)                # [B*S, D]
+            idx_flat = topk_idx.reshape(-1, self.k)  # [B*S, k]
+            score_flat = topk_score.reshape(-1, self.k)
 
-        for i in range(self.num_experts):
-            # 找到被路由到 expert i 的 token
-            mask = (idx_flat == i)  # [B*S, k]
+            for i in range(self.num_experts):
+                with record_scope(f"SMoE/expert_{i}"):
+                    # 找到被路由到 expert i 的 token
+                    mask = (idx_flat == i)  # [B*S, k]
 
-            if not mask.any():
-                continue
+                    if not mask.any():
+                        continue
 
-            # 哪些 token 命中了 expert i
-            token_idx, k_idx = mask.nonzero(as_tuple=True)
+                    # 哪些 token 命中了 expert i
+                    token_idx, k_idx = mask.nonzero(as_tuple=True)
 
-            selected_x = x_flat[token_idx]  # [N, D]
+                    selected_x = x_flat[token_idx]  # [N, D]
 
-            expert_out = self.experts[i](selected_x)  # [N, D]
+                    expert_out = self.experts[i](selected_x)  # [N, D]
 
-            weight = score_flat[token_idx, k_idx].unsqueeze(-1)
+                    weight = score_flat[token_idx, k_idx].unsqueeze(-1)
 
-            out_flat = out.reshape(-1, D)
-            out_flat[token_idx] += expert_out * weight
+                    out_flat = out.reshape(-1, D)
+                    out_flat[token_idx] += expert_out * weight
 
-        importance = probs.sum(dim=(0,1))  # [E]
-        moe_loss = (importance.std() / (importance.mean() + 1e-6))
+            importance = probs.sum(dim=(0,1))  # [E]
+            moe_loss = (importance.std() / (importance.mean() + 1e-6))
 
-        return out, moe_loss
+            return out, moe_loss
 
 
 class TransformerEncoder(nn.Module):
     def __init__(self, d_model, n_heads, num_layers, dim_ff, act="relu",
-                 attention_fn=scaled_dot_product):
+                 attention_fn=scaled_dot_product, attn_mode="sdpa"):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.num_layers = num_layers
+        self.attn_mode = attn_mode
         assert d_model % n_heads == 0
 
         self.qkv_proj = nn.ModuleList([nn.Linear(d_model, 3 * d_model) for _ in range(num_layers)])
@@ -383,32 +451,51 @@ class TransformerEncoder(nn.Module):
             SMoE(d_model, dim_ff, num_experts=8, k=2)
             for _ in range(num_layers)
         ])
+        if self.attn_mode == "flash_varlen" and flash_attn_varlen_qkvpacked_func is None:
+            print("[WARNING] flash-attn not available, falling back to sdpa attention")
+            self.attn_mode = "sdpa"
 
     def forward(self, x, extension):
-        x = x.unsqueeze(0)
-        B, S, D = x.shape
+        with record_scope("TransformerEncoder"):
+            x = x.unsqueeze(0)
+            B, S, D = x.shape
 
-        moe_loss_total = 0.0
-        for i in range(self.num_layers):
-            residual = x
-            x = self.norm1[i](x)
-            qkv = self.qkv_proj[i](x)
-            qkv = qkv.view(B, S, self.n_heads, 3 * self.head_dim)
-            qkv = qkv.permute(0, 2, 1, 3)
-            q, k, v = torch.split(qkv, self.head_dim, dim=-1)
-            attn_out = self.attention_fn(q, k, v, extension)
-            attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, S, D)
-            x = residual + self.out_proj[i](attn_out)
-            residual = x
-            x = self.norm2[i](x)
+            moe_loss_total = 0.0
+            for i in range(self.num_layers):
+                with record_scope(f"Transformer/layer_{i}"):
+                    residual = x
+                    x = self.norm1[i](x)
+                    with record_scope(f"Transformer/layer_{i}/attention"):
+                        qkv = self.qkv_proj[i](x)
+                        if self.attn_mode == "flash_varlen" and qkv.dtype in (torch.float16, torch.bfloat16):
+                            qkv = qkv.view(B, S, self.n_heads, 3, self.head_dim)
+                            qkv_packed = qkv.squeeze(0).permute(0, 2, 1, 3).contiguous()
+                            attn_out = flash_attn_varlen_qkvpacked_func(
+                                qkv_packed,
+                                extension["cu_seqlens"],
+                                extension["max_seqlen"],
+                                dropout_p=0.0,
+                                causal=True,
+                            )
+                            attn_out = attn_out.reshape(B, S, D)
+                        else:
+                            qkv = qkv.view(B, S, self.n_heads, 3 * self.head_dim)
+                            qkv = qkv.permute(0, 2, 1, 3)
+                            q, k, v = torch.split(qkv, self.head_dim, dim=-1)
+                            attn_out = self.attention_fn(q, k, v, extension)
+                            attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, S, D)
+                    x = residual + self.out_proj[i](attn_out)
+                    residual = x
+                    x = self.norm2[i](x)
 
-            moe_out, moe_loss = self.moe[i](x)
+                    with record_scope(f"Transformer/layer_{i}/moe"):
+                        moe_out, moe_loss = self.moe[i](x)
 
-            x = residual + moe_out
+                    x = residual + moe_out
 
-            moe_loss_total = moe_loss_total + moe_loss
+                    moe_loss_total = moe_loss_total + moe_loss
 
-        return x, moe_loss_total
+            return x, moe_loss_total
 
 
 class CTRModel(nn.Module):
@@ -429,29 +516,45 @@ class CTRModel(nn.Module):
         return out_mask
 
     def forward(self, batch):
-        seq_input = self.rep_encoder(batch)
-        seq_mask = self.get_sequence_causal_mask(batch["user_offsets"])
-        encoder_output, moe_loss = self.seq_encoder(
-            x=seq_input,
-            extension={"mask": seq_mask.unsqueeze(0).unsqueeze(0)},
-        )
-        encoder_output_dim = encoder_output.shape[-1]
-        encoder_output = encoder_output.reshape(1, -1, encoder_output_dim).squeeze(0)
-        pred = self.linear(encoder_output)
-        pred_logits = torch.clamp(pred, min=-15.0, max=15.0)
-        return pred_logits, moe_loss
+        with record_scope("CTRModel"):
+            seq_input = self.rep_encoder(batch)
+            if getattr(self.seq_encoder, "attn_mode", "sdpa") == "flash_varlen":
+                with record_scope("CTRModel/build_flash_varlen_info"):
+                    user_offsets = batch["user_offsets"]
+                    lengths = user_offsets[1:] - user_offsets[:-1]
+                    max_seqlen = int(lengths.max().item()) if lengths.numel() else 0
+                    extension = {
+                        "cu_seqlens": user_offsets.to(dtype=torch.int32),
+                        "max_seqlen": max_seqlen,
+                    }
+            else:
+                with record_scope("CTRModel/build_mask"):
+                    seq_mask = self.get_sequence_causal_mask(batch["user_offsets"])
+                    extension = {"mask": seq_mask.unsqueeze(0).unsqueeze(0)}
+            encoder_output, moe_loss = self.seq_encoder(
+                x=seq_input,
+                extension=extension,
+            )
+            with record_scope("CTRModel/pred_head"):
+                encoder_output_dim = encoder_output.shape[-1]
+                encoder_output = encoder_output.reshape(1, -1, encoder_output_dim).squeeze(0)
+                pred = self.linear(encoder_output)
+                pred_logits = torch.clamp(pred, min=-15.0, max=15.0)
+            return pred_logits, moe_loss
 
 
 # ============================================================
 # 模型加载入口
 # ============================================================
 
-def load_model(device='cuda:0', ckpt_path=None):
+def load_model(device='cuda:0', ckpt_path=None, dtype='bf16', attn_mode='flash_varlen'):
     """加载模型并返回，供 evaluation.py 调用。
 
     Args:
         device: 推理设备（默认 'cuda:0'）
         ckpt_path: checkpoint 文件路径，默认使用 infer.py 同目录下的 ckpt.pt
+        dtype: 模型推理 dtype，可选 fp32、bf16、fp16
+        attn_mode: attention 实现，可选 sdpa、flash_varlen
 
     Returns:
         (model, device) 元组
@@ -477,10 +580,18 @@ def load_model(device='cuda:0', ckpt_path=None):
         num_layers=num_layers,
         dim_ff=dim_ff,
         act="relu",
+        attn_mode=attn_mode,
     )
     model = CTRModel(rep_encoder, seq_encoder, d_model=d_model)
 
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
+    if seq_encoder.attn_mode == "flash_varlen":
+        if dev.type != "cuda":
+            print("[WARNING] flash_varlen requested on CPU, falling back to sdpa attention")
+            seq_encoder.attn_mode = "sdpa"
+        elif dtype == "fp32":
+            print("[WARNING] flash_varlen requires bf16/fp16, falling back to sdpa attention for fp32")
+            seq_encoder.attn_mode = "sdpa"
 
     # 加载 checkpoint
     # 若需要加载自定义修改的权重，请修改 479-488行逻辑，强制使用你文件夹中的权重
@@ -496,9 +607,22 @@ def load_model(device='cuda:0', ckpt_path=None):
     else:
         print(f"[WARNING] Checkpoint {ckpt_path} not found, using random weights")
 
-    model.to(dev)
+    if dtype == 'bf16':
+        if dev.type != 'cuda':
+            print("[WARNING] bf16 requested on CPU, falling back to fp32")
+            model.to(dev)
+        else:
+            model.to(dev, dtype=torch.bfloat16)
+    elif dtype == 'fp16':
+        if dev.type != 'cuda':
+            print("[WARNING] fp16 requested on CPU, falling back to fp32")
+            model.to(dev)
+        else:
+            model.to(dev, dtype=torch.float16)
+    else:
+        model.to(dev)
     model.eval()
-    print(f"[INFO] Model ready. Device: {dev}")
+    print(f"[INFO] Model ready. Device: {dev}, dtype: {dtype}, attn_mode: {seq_encoder.attn_mode}")
 
     return model, dev
 
@@ -586,7 +710,17 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--ckpt', type=str, default=None, help='checkpoint 文件路径，默认使用同目录下的 ckpt.pt')
+    parser.add_argument('--profile-batches', type=int, default=0,
+                        help='使用 torch.profiler 分析前 N 个 batch；0 表示正常完整推理')
+    parser.add_argument('--profile-dir', type=str, default='profiler_traces',
+                        help='torch.profiler trace 输出目录，仅在 --profile-batches > 0 时生效')
+    parser.add_argument('--dtype', type=str, default='bf16', choices=['fp32', 'bf16', 'fp16'],
+                        help='模型推理 dtype，默认 bf16')
+    parser.add_argument('--attn-mode', type=str, default='flash_varlen', choices=['sdpa', 'flash_varlen'],
+                        help='attention 实现，默认 sdpa；flash_varlen 需要 flash-attn 且 dtype 为 bf16/fp16')
     args = parser.parse_args()
+    global PROFILE_SCOPES
+    PROFILE_SCOPES = args.profile_batches > 0
 
     cur_path = Path(__file__).parent.absolute()
     ref_dir = cur_path / 'dataset'
@@ -670,7 +804,7 @@ def main():
     print('[INFO] data loading done')
 
     # ----- 加载模型 -----
-    model, dev = load_model(ckpt_path=args.ckpt)
+    model, dev = load_model(ckpt_path=args.ckpt, dtype=args.dtype, attn_mode=args.attn_mode)
 
     # ----- 推理 -----
     print('*' * 20 + ' start inference ' + '*' * 20)
@@ -678,19 +812,64 @@ def main():
     all_probs = []
     time_sum = 0.0
 
-    with torch.no_grad():
+    def infer_one_batch(batch):
+        batch = move_batch_to_device(batch, dev)
+        pred_mask = batch["pred_mask"].bool()
+        if dev.type == "cuda":
+            torch.cuda.synchronize()
+        t_start = time.time()
+        logits, moe_loss = model(batch)
+        logits = logits.squeeze(-1)
+        probs = torch.sigmoid(logits)
+        if dev.type == "cuda":
+            torch.cuda.synchronize()
+        elapsed = time.time() - t_start
+
+        masked_logids = batch["logid"][pred_mask].cpu().tolist()
+        masked_probs = probs[pred_mask].cpu().tolist()
+        return masked_logids, masked_probs, elapsed
+
+    if args.profile_batches > 0:
+        from torch.profiler import ProfilerActivity, profile, tensorboard_trace_handler
+
+        activities = [ProfilerActivity.CPU]
+        if dev.type == "cuda":
+            activities.append(ProfilerActivity.CUDA)
+        profile_batches = min(args.profile_batches, len(all_batches))
+        profile_dir = Path(args.profile_dir)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        print(f'[INFO] profiling first {profile_batches} batches')
+        print(f'[INFO] writing profiler traces to {profile_dir.absolute()}')
+
+        with profile(
+            activities=activities,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=False,
+            on_trace_ready=tensorboard_trace_handler(str(profile_dir)),
+        ) as prof:
+            with torch.inference_mode():
+                for batch in tqdm(all_batches[:profile_batches], desc="Profile"):
+                    with record_scope("infer_one_batch"):
+                        masked_logids, masked_probs, elapsed = infer_one_batch(batch)
+                    time_sum += elapsed
+                    all_logids.extend(masked_logids)
+                    all_probs.extend(masked_probs)
+                    prof.step()
+
+        sort_by = "cuda_time_total" if dev.type == "cuda" else "cpu_time_total"
+        print(prof.key_averages().table(sort_by=sort_by, row_limit=40))
+        csv_path = profile_dir / "key_averages.csv"
+        export_profiler_csv(prof, csv_path)
+        print(f'[INFO] profiled inference time: {round(time_sum, 4)}s')
+        print(f'[INFO] profiler key averages written to {csv_path}')
+        print(f'[INFO] open with: tensorboard --logdir {profile_dir}')
+        return None
+
+    with torch.inference_mode():
         for batch in tqdm(all_batches, desc="Inference"):
-            batch = move_batch_to_device(batch, dev)
-            pred_mask = batch["pred_mask"].bool()
-
-            t_start = time.time()
-            logits, moe_loss = model(batch)
-            logits = logits.squeeze(-1)
-            probs = torch.sigmoid(logits)
-            time_sum += time.time() - t_start
-
-            masked_logids = batch["logid"][pred_mask].cpu().tolist()
-            masked_probs = probs[pred_mask].cpu().tolist()
+            masked_logids, masked_probs, elapsed = infer_one_batch(batch)
+            time_sum += elapsed
             all_logids.extend(masked_logids)
             all_probs.extend(masked_probs)
 
