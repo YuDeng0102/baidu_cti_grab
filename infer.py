@@ -386,6 +386,26 @@ class SMoE(nn.Module):
         ])
 
         self.gate = TopKGate(d_model, num_experts, k=k)
+        self._stacked_expert_cache = None
+
+    def _get_stacked_expert_params(self, device, dtype):
+        cache = self._stacked_expert_cache
+        if cache is not None:
+            cached_device = cache["w1"].device
+            cached_dtype = cache["w1"].dtype
+            if cached_device == device and cached_dtype == dtype:
+                return cache
+
+        w1 = torch.stack([expert.fc1.weight.transpose(0, 1).contiguous()
+                          for expert in self.experts], dim=0)
+        b1 = torch.stack([expert.fc1.bias for expert in self.experts], dim=0)
+        w2 = torch.stack([expert.fc2.weight.transpose(0, 1).contiguous()
+                          for expert in self.experts], dim=0)
+        b2 = torch.stack([expert.fc2.bias for expert in self.experts], dim=0)
+
+        cache = {"w1": w1, "b1": b1, "w2": w2, "b2": b2}
+        self._stacked_expert_cache = cache
+        return cache
 
     def forward(self, x):
         with record_scope("SMoE"):
@@ -401,26 +421,35 @@ class SMoE(nn.Module):
             x_flat = x.reshape(-1, D)                # [B*S, D]
             idx_flat = topk_idx.reshape(-1, self.k)  # [B*S, k]
             score_flat = topk_score.reshape(-1, self.k)
+            route_expert = idx_flat.reshape(-1)
+            route_weight = score_flat.reshape(-1)
+            route_token = torch.arange(B * S, device=x.device, dtype=torch.long).repeat_interleave(self.k)
 
-            for i in range(self.num_experts):
-                with record_scope(f"SMoE/expert_{i}"):
-                    # 找到被路由到 expert i 的 token
-                    mask = (idx_flat == i)  # [B*S, k]
+            sort_order = torch.argsort(route_expert, stable=True)
+            sorted_expert = route_expert[sort_order]
+            sorted_weight = route_weight[sort_order]
+            sorted_token = route_token[sort_order]
+            sorted_x = x_flat[sorted_token]
 
-                    if not mask.any():
-                        continue
+            counts = torch.bincount(sorted_expert, minlength=self.num_experts)
+            if sorted_expert.numel() > 0:
+                starts = torch.cumsum(counts, dim=0) - counts
+                position_in_expert = torch.arange(sorted_expert.numel(), device=x.device, dtype=torch.long)
+                position_in_expert = position_in_expert - torch.repeat_interleave(starts, counts)
+                max_count = int(counts.max().item())
 
-                    # 哪些 token 命中了 expert i
-                    token_idx, k_idx = mask.nonzero(as_tuple=True)
+                packed_x = x.new_zeros((self.num_experts, max_count, D))
+                packed_x[sorted_expert, position_in_expert] = sorted_x
 
-                    selected_x = x_flat[token_idx]  # [N, D]
+                params = self._get_stacked_expert_params(device=x.device, dtype=x.dtype)
+                with record_scope("SMoE/grouped_experts"):
+                    hidden = torch.bmm(packed_x, params["w1"]) + params["b1"].unsqueeze(1)
+                    hidden = F.relu(hidden)
+                    packed_out = torch.bmm(hidden, params["w2"]) + params["b2"].unsqueeze(1)
 
-                    expert_out = self.experts[i](selected_x)  # [N, D]
-
-                    weight = score_flat[token_idx, k_idx].unsqueeze(-1)
-
-                    out_flat = out.reshape(-1, D)
-                    out_flat[token_idx] += expert_out * weight
+                routed_out = packed_out[sorted_expert, position_in_expert]
+                weighted_out = routed_out * sorted_weight.unsqueeze(-1)
+                out.reshape(-1, D).index_add_(0, sorted_token, weighted_out)
 
             importance = probs.sum(dim=(0,1))  # [E]
             moe_loss = (importance.std() / (importance.mean() + 1e-6))
