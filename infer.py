@@ -741,6 +741,8 @@ def main():
     parser.add_argument('--ckpt', type=str, default=None, help='checkpoint 文件路径，默认使用同目录下的 ckpt.pt')
     parser.add_argument('--profile-batches', type=int, default=0,
                         help='使用 torch.profiler 分析前 N 个 batch；0 表示正常完整推理')
+    parser.add_argument('--profile-warmup-batches', type=int, default=20,
+                        help='在 torch.profiler 开始前先预热的 batch 数，仅在 --profile-batches > 0 时生效')
     parser.add_argument('--profile-dir', type=str, default='profiler_traces',
                         help='torch.profiler trace 输出目录，仅在 --profile-batches > 0 时生效')
     parser.add_argument('--dtype', type=str, default='bf16', choices=['fp32', 'bf16', 'fp16'],
@@ -864,10 +866,22 @@ def main():
         activities = [ProfilerActivity.CPU]
         if dev.type == "cuda":
             activities.append(ProfilerActivity.CUDA)
-        profile_batches = min(args.profile_batches, len(all_batches))
+        warmup_batches = min(max(args.profile_warmup_batches, 0), len(all_batches))
+        remaining_batches = len(all_batches) - warmup_batches
+        profile_batches = min(args.profile_batches, remaining_batches)
         profile_dir = Path(args.profile_dir)
         profile_dir.mkdir(parents=True, exist_ok=True)
-        print(f'[INFO] profiling first {profile_batches} batches')
+        if warmup_batches > 0:
+            print(f'[INFO] warming up {warmup_batches} batches before profiling')
+            with torch.inference_mode():
+                for batch in tqdm(all_batches[:warmup_batches], desc="Warmup"):
+                    infer_one_batch(batch)
+        if profile_batches <= 0:
+            print('[WARNING] no batches left to profile after warmup, skipping profiler')
+            return None
+
+        profile_slice = all_batches[warmup_batches:warmup_batches + profile_batches]
+        print(f'[INFO] profiling {profile_batches} batches after {warmup_batches} warmup batches')
         print(f'[INFO] writing profiler traces to {profile_dir.absolute()}')
 
         with profile(
@@ -878,7 +892,7 @@ def main():
             on_trace_ready=tensorboard_trace_handler(str(profile_dir)),
         ) as prof:
             with torch.inference_mode():
-                for batch in tqdm(all_batches[:profile_batches], desc="Profile"):
+                for batch in tqdm(profile_slice, desc="Profile"):
                     with record_scope("infer_one_batch"):
                         masked_logids, masked_probs, elapsed = infer_one_batch(batch)
                     time_sum += elapsed
