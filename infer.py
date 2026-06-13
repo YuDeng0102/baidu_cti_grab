@@ -1,11 +1,7 @@
-import sys
-import os
 import csv
+from local_env import setup_local_libraries
 
-# 获取当前环境脚本所在目录或指定绝对路径
-if os.path.exists("../libraries"):
-    lib_path = os.path.abspath("../libraries")
-    sys.path.insert(0, lib_path)  # fix some import error
+setup_local_libraries(__file__)
 
 import math
 import argparse
@@ -18,6 +14,89 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+
+import os
+import sys
+
+if os.environ.get("QUANT_MODE") != "preprocess":
+    _quant_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "quantization"
+    )
+    if _quant_dir not in sys.path:
+        sys.path.append(_quant_dir)
+    from w8a8_triton_kernels import w8a8_linear
+    from w8a8_preprocess import QuantizedWeight
+
+    class StaticQuantizedLinear(nn.Module):
+        def __init__(
+            self, in_features, out_features, bias=True, device=None, dtype=None
+        ):
+            super().__init__()
+            self.in_features = in_features
+            self.out_features = out_features
+            self.use_quant = in_features >= 14336
+            if self.use_quant:
+                self.register_buffer(
+                    "qweight_t",
+                    torch.zeros((in_features, out_features), dtype=torch.int8),
+                )
+                self.register_buffer(
+                    "weight_scale", torch.zeros((out_features,), dtype=torch.float32)
+                )
+                self.register_buffer(
+                    "static_act_scale", torch.zeros((1,), dtype=torch.float32)
+                )
+                if bias:
+                    self.register_buffer(
+                        "bias",
+                        torch.zeros(
+                            (out_features,),
+                            dtype=dtype if dtype is not None else torch.float32,
+                        ),
+                    )
+                else:
+                    self.register_buffer("bias", None)
+            else:
+                self.weight = nn.Parameter(
+                    torch.empty(
+                        (out_features, in_features),
+                        device=device,
+                        dtype=dtype if dtype is not None else torch.float32,
+                    )
+                )
+                if bias:
+                    self.bias = nn.Parameter(
+                        torch.empty(
+                            out_features,
+                            device=device,
+                            dtype=dtype if dtype is not None else torch.float32,
+                        )
+                    )
+                else:
+                    self.register_parameter("bias", None)
+
+        def forward(self, input):
+            if self.use_quant:
+                qw = QuantizedWeight(
+                    qweight_t=self.qweight_t,
+                    scale=self.weight_scale,
+                    fp_weight=torch.empty(0, device=input.device),
+                )
+                out = w8a8_linear(
+                    input, qw, act_mode="static", static_act_scale=self.static_act_scale
+                )
+                if self.bias is not None:
+                    out = out + self.bias
+                return out
+            else:
+                return F.linear(input, self.weight, self.bias)
+
+    nn.Linear = StaticQuantizedLinear
+
+from kernels.rep_encoder_fusion import (
+    cat_free_layernorm_linear,
+    layernorm_linear_triton,
+)
 
 try:
     from flash_attn import flash_attn_varlen_qkvpacked_func
@@ -318,13 +397,22 @@ def move_batch_to_device(batch, device):
 
 
 class RepEncoder(nn.Module):
-    def __init__(self, vocab_size, emb_dim, padding_idx=0, slot_num=0, d_model=0):
+    def __init__(
+        self,
+        vocab_size,
+        emb_dim,
+        padding_idx=0,
+        slot_num=0,
+        d_model=0,
+        fuse_mode="torch",
+    ):
         super().__init__()
         self.emb = nn.Embedding(
             num_embeddings=vocab_size, embedding_dim=emb_dim, padding_idx=padding_idx
         )
         self.emb_dim = emb_dim
         self.slot_num = slot_num
+        self.fuse_mode = fuse_mode
         self.input_norm = nn.LayerNorm(slot_num * emb_dim)
         self.linear = nn.Linear(in_features=slot_num * emb_dim, out_features=d_model)
 
@@ -345,9 +433,19 @@ class RepEncoder(nn.Module):
                     )
                     pooled_embs.append(res)
             with record_scope("RepEncoder/fuse"):
-                fused_embs = torch.cat(pooled_embs, dim=1)
-                norm_emb = self.input_norm(fused_embs)
-                rep_emb = self.linear(norm_emb)
+                if self.fuse_mode == "cat_free_ref":
+                    rep_emb = cat_free_layernorm_linear(
+                        pooled_embs, self.input_norm, self.linear
+                    )
+                elif self.fuse_mode == "triton_ln_linear":
+                    fused_embs = torch.cat(pooled_embs, dim=1)
+                    rep_emb = layernorm_linear_triton(
+                        fused_embs, self.input_norm, self.linear
+                    )
+                else:
+                    fused_embs = torch.cat(pooled_embs, dim=1)
+                    norm_emb = self.input_norm(fused_embs)
+                    rep_emb = self.linear(norm_emb)
             return rep_emb
 
 
@@ -418,15 +516,14 @@ class SMoE(nn.Module):
             if cached_device == device and cached_dtype == dtype:
                 return cache
 
-        w1 = torch.stack(
-            [expert.fc1.weight.transpose(0, 1).contiguous() for expert in self.experts],
-            dim=0,
-        )
+        def get_w(layer):
+            if hasattr(layer, "use_quant") and layer.use_quant:
+                return (layer.qweight_t.to(dtype) * layer.weight_scale).contiguous()
+            return layer.weight.transpose(0, 1).contiguous()
+
+        w1 = torch.stack([get_w(expert.fc1) for expert in self.experts], dim=0)
         b1 = torch.stack([expert.fc1.bias for expert in self.experts], dim=0)
-        w2 = torch.stack(
-            [expert.fc2.weight.transpose(0, 1).contiguous() for expert in self.experts],
-            dim=0,
-        )
+        w2 = torch.stack([get_w(expert.fc2) for expert in self.experts], dim=0)
         b2 = torch.stack([expert.fc2.bias for expert in self.experts], dim=0)
 
         cache = {"w1": w1, "b1": b1, "w2": w2, "b2": b2}
@@ -636,7 +733,13 @@ class CTRModel(nn.Module):
 # ============================================================
 
 
-def load_model(device="cuda:0", ckpt_path=None, dtype="bf16", attn_mode="flash_varlen"):
+def load_model(
+    device="cuda:0",
+    ckpt_path=None,
+    dtype="bf16",
+    attn_mode="flash_varlen",
+    rep_fuse_mode="torch",
+):
     """加载模型并返回，供 evaluation.py 调用。
 
     Args:
@@ -644,6 +747,7 @@ def load_model(device="cuda:0", ckpt_path=None, dtype="bf16", attn_mode="flash_v
         ckpt_path: checkpoint 文件路径，默认使用 infer.py 同目录下的 ckpt.pt
         dtype: 模型推理 dtype，可选 fp32、bf16、fp16
         attn_mode: attention 实现，可选 sdpa、flash_varlen
+        rep_fuse_mode: RepEncoder fuse 实现，可选 torch、cat_free_ref、triton_ln_linear
 
     Returns:
         (model, device) 元组
@@ -662,6 +766,7 @@ def load_model(device="cuda:0", ckpt_path=None, dtype="bf16", attn_mode="flash_v
         padding_idx=0,
         slot_num=slot_num,
         d_model=d_model,
+        fuse_mode=rep_fuse_mode,
     )
     seq_encoder = TransformerEncoder(
         d_model=d_model,
@@ -829,12 +934,6 @@ def main():
         help="使用 torch.profiler 分析前 N 个 batch；0 表示正常完整推理",
     )
     parser.add_argument(
-        "--profile-warmup-batches",
-        type=int,
-        default=20,
-        help="在 torch.profiler 开始前先预热的 batch 数，仅在 --profile-batches > 0 时生效",
-    )
-    parser.add_argument(
         "--profile-dir",
         type=str,
         default="profiler_traces",
@@ -853,6 +952,13 @@ def main():
         default="flash_varlen",
         choices=["sdpa", "flash_varlen"],
         help="attention 实现，默认 sdpa；flash_varlen 需要 flash-attn 且 dtype 为 bf16/fp16",
+    )
+    parser.add_argument(
+        "--rep-fuse-mode",
+        type=str,
+        default="torch",
+        choices=["torch", "cat_free_ref", "triton_ln_linear"],
+        help="RepEncoder fuse 实现；cat_free_ref 是等价验证用 reference，默认 torch",
     )
     args = parser.parse_args()
     global PROFILE_SCOPES
@@ -956,7 +1062,10 @@ def main():
 
     # ----- 加载模型 -----
     model, dev = load_model(
-        ckpt_path=args.ckpt, dtype=args.dtype, attn_mode=args.attn_mode
+        ckpt_path=args.ckpt,
+        dtype=args.dtype,
+        attn_mode=args.attn_mode,
+        rep_fuse_mode=args.rep_fuse_mode,
     )
 
     # ----- 推理 -----
