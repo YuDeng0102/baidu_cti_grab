@@ -2,11 +2,14 @@ import os
 import sys
 import time
 import argparse
+import local_env
 
 # --- Competition Triton Cache Setup ---
-# Set the triton cache directory to a local folder so that the compiled kernels 
+# Set the triton cache directory to a local folder so that the compiled kernels
 # can be submitted with the code, completely eliminating JIT compilation overhead.
-os.environ["TRITON_CACHE_DIR"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "triton_cache")
+os.environ["TRITON_CACHE_DIR"] = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "triton_cache"
+)
 import torch
 import contextlib
 from pathlib import Path
@@ -20,7 +23,7 @@ from Utils.data_utils import (
     load_logids_from_file,
     CTRUserDataset,
     make_collate_fn,
-    move_batch_to_device
+    move_batch_to_device,
 )
 from models import (
     RepEncoder,
@@ -30,7 +33,7 @@ from models import (
     SMoE,
     TransformerEncoder,
     CTRModel,
-    load_model
+    load_model,
 )
 from metrics import _cal_score, _read_label, _read_predict
 
@@ -44,22 +47,49 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ckpt', type=str, default=None, help='checkpoint 文件路径，默认使用同目录下的 ckpt.pt')
-    parser.add_argument('--profile-batches', type=int, default=0,
-                        help='使用 torch.profiler 分析前 N 个 batch；0 表示正常完整推理')
-    parser.add_argument('--profile-dir', type=str, default='profiler_traces',
-                        help='torch.profiler trace 输出目录，仅在 --profile-batches > 0 时生效')
-    parser.add_argument('--dtype', type=str, default='bf16', choices=['fp32', 'bf16', 'fp16'],
-                        help='模型推理 dtype，默认 bf16')
-    parser.add_argument('--attn-mode', type=str, default='flash_varlen', choices=['sdpa', 'flash_varlen'],
-                        help='attention 实现，默认 sdpa；flash_varlen 需要 flash-attn 且 dtype 为 bf16/fp16')
-    parser.add_argument('--rep-fuse-mode', type=str, default='torch',
-                        choices=['torch', 'cat_free_ref', 'triton_ln_linear'],
-                        help='RepEncoder fuse 实现；cat_free_ref 是等价验证用 reference，默认 torch')
-    parser.add_argument('--quantized', action='store_true',
-                        help='使用量化模型结构')
+    parser.add_argument(
+        "--ckpt",
+        type=str,
+        default=None,
+        help="checkpoint 文件路径，默认使用同目录下的 ckpt.pt",
+    )
+    parser.add_argument(
+        "--profile-batches",
+        type=int,
+        default=0,
+        help="使用 torch.profiler 分析前 N 个 batch；0 表示正常完整推理",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=str,
+        default="profiler_traces",
+        help="torch.profiler trace 输出目录，仅在 --profile-batches > 0 时生效",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bf16",
+        choices=["fp32", "bf16", "fp16"],
+        help="模型推理 dtype，默认 bf16",
+    )
+    parser.add_argument(
+        "--attn-mode",
+        type=str,
+        default="flash_varlen",
+        choices=["sdpa", "flash_varlen"],
+        help="attention 实现，默认 sdpa；flash_varlen 需要 flash-attn 且 dtype 为 bf16/fp16",
+    )
+    parser.add_argument(
+        "--rep-fuse-mode",
+        type=str,
+        default="torch",
+        choices=["torch", "cat_free_ref", "triton_ln_linear"],
+        help="RepEncoder fuse 实现；cat_free_ref 是等价验证用 reference，默认 torch",
+    )
+    parser.add_argument("--quantized", action="store_true", help="使用量化模型结构")
     args = parser.parse_args()
     import Utils.profiler
+
     Utils.profiler.PROFILE_SCOPES = args.profile_batches > 0
 
     cur_path = Path(__file__).parent.absolute()
@@ -75,18 +105,25 @@ def main():
 
     shard_files = []
     total_batches = 0
-    if batches_cache_dir.exists() and any(batches_cache_dir.glob('shard_*.pt')):
-        print(f'[INFO] loading cached batch shards from {batches_cache_dir}')
-        shard_files = sorted(batches_cache_dir.glob('shard_*.pt'),
-                             key=lambda p: int(p.stem.split('_')[1]))
+    if batches_cache_dir.exists() and any(batches_cache_dir.glob("shard_*.pt")):
+        print(f"[INFO] loading cached batch shards from {batches_cache_dir}")
+        shard_files = sorted(
+            batches_cache_dir.glob("shard_*.pt"),
+            key=lambda p: int(p.stem.split("_")[1]),
+        )
         for sf in shard_files:
             shard_batches = torch.load(sf, weights_only=False)
             total_batches += len(shard_batches)
-            print(f'[INFO] loaded metadata for {len(shard_batches)} batches from {sf.name}')
+            print(
+                f"[INFO] loaded metadata for {len(shard_batches)} batches from {sf.name}"
+            )
             del shard_batches
         import gc
+
         gc.collect()
-        print(f'[INFO] loaded {total_batches} cached batches metadata total from {len(shard_files)} shards')
+        print(
+            f"[INFO] loaded {total_batches} cached batches metadata total from {len(shard_files)} shards"
+        )
     else:
         print("[INFO] start loading data from CSV")
         history_files = (
@@ -121,7 +158,7 @@ def main():
         )
 
         # 收集 batches 并按分片缓存
-        print('[INFO] collecting batches and saving sharded cache...')
+        print("[INFO] collecting batches and saving sharded cache...")
         batches_cache_dir.mkdir(parents=True, exist_ok=True)
         shard_idx = 0
         current_shard = []
@@ -151,11 +188,16 @@ def main():
                 f"~{current_size / 1024**3:.2f}GB"
             )
             shard_idx += 1
-        print(f'[INFO] saved {total_batches} batches to {shard_idx} shards in {batches_cache_dir}')
-        shard_files = sorted(batches_cache_dir.glob('shard_*.pt'),
-                             key=lambda p: int(p.stem.split('_')[1]))
+        print(
+            f"[INFO] saved {total_batches} batches to {shard_idx} shards in {batches_cache_dir}"
+        )
+        shard_files = sorted(
+            batches_cache_dir.glob("shard_*.pt"),
+            key=lambda p: int(p.stem.split("_")[1]),
+        )
         del current_shard
         import gc
+
         gc.collect()
 
     print("[INFO] data loading done")
@@ -167,6 +209,7 @@ def main():
                 yield batch
             del shard_batches
             import gc
+
             gc.collect()
 
     # ----- 加载模型 -----
