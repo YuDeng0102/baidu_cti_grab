@@ -17,48 +17,7 @@ except Exception as exc:
 from w8a8_preprocess import QuantizedWeight
 
 
-_W8A8_MM_CONFIGS = [
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 128, "GROUP_M": 8},
-        num_warps=8,
-        num_stages=4,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 8},
-        num_warps=8,
-        num_stages=4,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 256, "GROUP_M": 16},
-        num_warps=8,
-        num_stages=3,
-    ),
-    triton.Config(
-        {"BLOCK_M": 256, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 8},
-        num_warps=8,
-        num_stages=3,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 4},
-        num_warps=4,
-        num_stages=3,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 4},
-        num_warps=4,
-        num_stages=3,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 12},
-        num_warps=8,
-        num_stages=4,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 256, "GROUP_M": 8},
-        num_warps=8,
-        num_stages=4,
-    ),
-]
+
 
 
 @triton.jit
@@ -105,8 +64,7 @@ def _dynamic_per_token_quant_kernel(
     tl.store(scale_ptr + row, scale)
 
 
-@triton.autotune(configs=_W8A8_MM_CONFIGS, key=["N", "K"])
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _int8_mm_no_scale_kernel(
     a_ptr,
     b_ptr,
@@ -161,8 +119,7 @@ def _int8_mm_no_scale_kernel(
     tl.store(c_ptrs, acc.to(c_ptr.dtype.element_ty), mask=masks_m[:, None] & masks_n[None, :])
 
 
-@triton.autotune(configs=_W8A8_MM_CONFIGS, key=["N", "K"])
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _int8_mm_no_scale_nomask_kernel(
     a_ptr,
     b_ptr,
@@ -214,14 +171,14 @@ def _int8_mm_no_scale_nomask_kernel(
     tl.store(c_ptrs, acc.to(c_ptr.dtype.element_ty), mask=masks_m[:, None])
 
 
-@triton.autotune(configs=_W8A8_MM_CONFIGS, key=["N", "K"])
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _w8a8_scaled_mm_kernel(
     a_ptr,
     b_ptr,
     scale_a_ptr,
     scale_b_ptr,
     c_ptr,
+    bias_ptr,
     M,
     N,
     K,
@@ -232,6 +189,7 @@ def _w8a8_scaled_mm_kernel(
     stride_cm,
     stride_cn,
     STATIC_ACT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -280,18 +238,22 @@ def _w8a8_scaled_mm_kernel(
     scale_b = tl.load(scale_b_ptr + offs_n, mask=masks_n, other=0.0)
     out = acc_f * scale_b[None, :]
 
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=masks_n, other=0.0).to(tl.float32)
+        out += bias[None, :]
+
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=masks_m[:, None] & masks_n[None, :])
 
 
-@triton.autotune(configs=_W8A8_MM_CONFIGS, key=["N", "K"])
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _w8a8_scaled_mm_nomask_kernel(
     a_ptr,
     b_ptr,
     scale_a_ptr,
     scale_b_ptr,
     c_ptr,
+    bias_ptr,
     M,
     N,
     K,
@@ -302,6 +264,7 @@ def _w8a8_scaled_mm_nomask_kernel(
     stride_cm,
     stride_cn,
     STATIC_ACT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -346,6 +309,10 @@ def _w8a8_scaled_mm_nomask_kernel(
 
     scale_b = tl.load(scale_b_ptr + offs_n)
     out = acc_f * scale_b[None, :]
+
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n).to(tl.float32)
+        out += bias[None, :]
 
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=masks_m[:, None])
@@ -506,6 +473,7 @@ def w8a8_scaled_mm_out(
     scale_a: torch.Tensor,
     out_2d: torch.Tensor,
     *,
+    bias: torch.Tensor | None = None,
     static_act: bool,
 ) -> torch.Tensor:
     assert xq_2d.ndim == 2
@@ -514,6 +482,24 @@ def w8a8_scaled_mm_out(
 
     M = xq_2d.shape[0]
     N = qweight.qweight_t.shape[1]
+    
+    # --- Shape-based Heuristic Dispatcher ---
+    block_n = min(128, triton.next_power_of_2(N))
+    block_k = min(128, triton.next_power_of_2(K))
+    if M < 2048:
+        block_m = 32
+        num_warps = 4
+        num_stages = 3
+    elif M < 4096:
+        block_m = 128
+        num_warps = 8
+        num_stages = 3
+    else:
+        # A800 / Data Center GPU optimization for massive batch sizes
+        block_m = 256
+        num_warps = 8
+        num_stages = 3
+
     assert out_2d.shape == (M, N)
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
@@ -529,6 +515,7 @@ def w8a8_scaled_mm_out(
         scale_a,
         qweight.scale,
         out_2d,
+        bias if bias is not None else out_2d,
         M,
         N,
         K,
@@ -539,6 +526,13 @@ def w8a8_scaled_mm_out(
         out_2d.stride(0),
         out_2d.stride(1),
         STATIC_ACT=static_act,
+        HAS_BIAS=bias is not None,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        GROUP_M=8,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return out_2d
 
@@ -548,6 +542,7 @@ def w8a8_scaled_mm(
     qweight: QuantizedWeight,
     scale_a: torch.Tensor,
     *,
+    bias: torch.Tensor | None = None,
     out_dtype: torch.dtype,
     static_act: bool,
 ) -> torch.Tensor:
@@ -564,6 +559,7 @@ def w8a8_scaled_mm(
         qweight,
         scale_a,
         out_2d,
+        bias=bias,
         static_act=static_act,
     )
 
@@ -580,6 +576,22 @@ def int8_mm_no_scale_out(
     M = xq_2d.shape[0]
     N = qweight.qweight_t.shape[1]
     assert out_2d.shape == (M, N)
+    # --- Shape-based Heuristic Dispatcher ---
+    block_n = min(128, triton.next_power_of_2(N))
+    block_k = min(128, triton.next_power_of_2(K))
+    if M < 2048:
+        block_m = 32
+        num_warps = 4
+        num_stages = 3
+    elif M < 4096:
+        block_m = 128
+        num_warps = 8
+        num_stages = 3
+    else:
+        block_m = 256
+        num_warps = 8
+        num_stages = 3
+
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
     )
@@ -601,6 +613,12 @@ def int8_mm_no_scale_out(
         qweight.qweight_t.stride(1),
         out_2d.stride(0),
         out_2d.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        GROUP_M=8,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return out_2d
 
@@ -626,6 +644,7 @@ def w8a8_linear(
     x: torch.Tensor,
     qweight: QuantizedWeight,
     *,
+    bias: torch.Tensor | None = None,
     act_mode: str,
     static_act_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -644,6 +663,7 @@ def w8a8_linear(
         xq,
         qweight,
         scale_a,
+        bias=bias,
         out_dtype=x.dtype,
         static_act=(act_mode == "static"),
     )

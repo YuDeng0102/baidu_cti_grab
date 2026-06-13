@@ -3,3 +3,5 @@ predict.txt
 .vscode/
 __pycache__/
 profile*/
+*.zip
+triton_cache/
