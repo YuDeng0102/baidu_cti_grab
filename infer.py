@@ -330,22 +330,52 @@ class RepEncoder(nn.Module):
 
     def forward(self, batch):
         with record_scope("RepEncoder"):
-            pooled_embs = []
             max_idx = self.emb.num_embeddings - 1
-            for i in range(self.slot_num):
-                with record_scope(f"RepEncoder/slot_{i + 1:02d}"):
+
+            # 将所有 slot 拼接成单次 embedding_bag 调用：
+            # 每个 slot 的 offsets 是该 slot 内的 bag 起始位置（长度 N+1），
+            # 把每个 slot 的 bag 起始（去掉末尾）按之前 slot 的 value 总数平移，
+            # 再拼接得到全局 bag 起始数组，从而把 28 个 slot 的
+            # (gather + segment_reduce) ~56 次 kernel 融合为 1 次 embedding_bag。
+            with record_scope("RepEncoder/gather_offsets"):
+                values_list = []
+                bag_starts = []
+                base = 0
+                num_items = None
+                for i in range(self.slot_num):
                     values, offsets = batch[i + 1]
-                    offsets = offsets.to(values.device)
-                    values = values.clamp(
-                        0, max_idx
-                    )  # 超出 vocab_size 的 sign id 截断，避免越界
-                    sign_emb = self.emb(values)
-                    res = torch.segment_reduce(
-                        sign_emb, reduce="sum", offsets=offsets, initial=0
+                    if num_items is None:
+                        num_items = offsets.numel() - 1
+                    values_list.append(values)
+                    # offsets[:-1] 是该 slot 的 N 个 bag 起始，平移 base 到全局坐标
+                    bag_starts.append(offsets[:-1] + base)
+                    base += values.numel()
+
+                all_values = torch.cat(values_list).clamp(0, max_idx)
+                combined_offsets = torch.cat(bag_starts)
+
+            with record_scope("RepEncoder/embedding_bag"):
+                if all_values.numel() == 0:
+                    pooled = self.emb.weight.new_zeros(
+                        (self.slot_num * num_items, self.emb_dim)
                     )
-                    pooled_embs.append(res)
+                else:
+                    pooled = F.embedding_bag(
+                        all_values,
+                        self.emb.weight,
+                        offsets=combined_offsets,
+                        mode="sum",
+                        padding_idx=self.emb.padding_idx,
+                    )  # [slot_num * N, emb_dim]，按 slot 主序排列
+
             with record_scope("RepEncoder/fuse"):
-                fused_embs = torch.cat(pooled_embs, dim=1)
+                # [slot_num, N, emb_dim] -> [N, slot_num, emb_dim] -> [N, slot_num*emb_dim]
+                # 与原先 torch.cat(pooled_embs, dim=1) 的列布局完全一致
+                fused_embs = (
+                    pooled.view(self.slot_num, num_items, self.emb_dim)
+                    .permute(1, 0, 2)
+                    .reshape(num_items, self.slot_num * self.emb_dim)
+                )
                 norm_emb = self.input_norm(fused_embs)
                 rep_emb = self.linear(norm_emb)
             return rep_emb
